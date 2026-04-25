@@ -1,0 +1,15 @@
+# Secrets — НИКОГДА не коммитить
+firebase.config.js
+.env
+.env.local
+.env*.local
+
+# Expo
+node_modules/
+.expo/
+dist/
+web-build/
+
+# OS
+.DS_Store
+*.log

@@ -50,6 +50,7 @@ import {
 import {
   getStorage, ref as sRef, uploadBytes, getDownloadURL,
 } from 'firebase/storage';
+import { firebaseConfig, OPENAI_KEY } from './firebase.config';
 
 const { width, height } = Dimensions.get('window');
 const Tab = createBottomTabNavigator();
@@ -60,7 +61,8 @@ const Tab = createBottomTabNavigator();
 const CONFIG = {
   // Генерация: 'pollinations' (бесплатно) или 'openai' (нужен ключ)
   generator: 'pollinations',
-  openaiKey: '', // вставь сюда если выбрал 'openai'
+  // Ключ читается из firebase.config.js (в .gitignore) — НЕ хардкодить здесь
+  openaiKey: OPENAI_KEY,
 
   // Firebase Storage загрузка (если выключить — URL берётся напрямую)
   uploadToStorage: false,
@@ -72,16 +74,8 @@ const CONFIG = {
 };
 
 // ═══════════════════════════════════════════════════════════════
-// FIREBASE
+// FIREBASE — конфиг читается из firebase.config.js (gitignored)
 // ═══════════════════════════════════════════════════════════════
-const firebaseConfig = {
-  apiKey: 'AIzaSyDWKxNNIdbIRsdnHSRZUru39tQ1kpAD1EY',
-  authDomain: 'audio-e56eb.firebaseapp.com',
-  projectId: 'audio-e56eb',
-  storageBucket: 'audio-e56eb.firebasestorage.app',
-  messagingSenderId: '139741641228',
-  appId: '1:139741641228:web:e0881cefe26c4f1d974c29',
-};
 const fbApp   = getApps().length === 0 ? initializeApp(firebaseConfig) : getApps()[0];
 const auth    = getAuth(fbApp);
 const db      = getFirestore(fbApp);
@@ -355,21 +349,61 @@ const withTimeout = (promise, ms, label='operation') =>
 
 
 // ═══════════════════════════════════════════════════════════════
+// SECURITY HELPERS
+// ═══════════════════════════════════════════════════════════════
+
+// Убирает символы, способные сломать prompt-injection атаку
+const sanitizePromptInput = (input) =>
+  String(input)
+    .replace(/[\x00-\x1F\x7F]/g, ' ')  // control chars
+    .replace(/[<>{}|\\^`]/g, '')         // shell/template meta
+    .slice(0, 500)
+    .trim();
+
+// Санитизация имени пользователя
+const sanitizeName = (name) =>
+  String(name || '')
+    .replace(/[<>&"']/g, '')
+    .replace(/[\x00-\x1F]/g, '')
+    .trim()
+    .slice(0, 50) || 'User';
+
+// Разрешённые домены для скачивания изображений
+const ALLOWED_IMAGE_HOSTS = [
+  'image.pollinations.ai',
+  'firebasestorage.googleapis.com',
+  'oaidalleapiprodscus.blob.core.windows.net',
+  'storage.googleapis.com',
+];
+
+const isAllowedImageUrl = (url) => {
+  try {
+    const { protocol, hostname } = new URL(url);
+    return (protocol === 'https:') && ALLOWED_IMAGE_HOSTS.includes(hostname);
+  } catch {
+    return false;
+  }
+};
+
+// ═══════════════════════════════════════════════════════════════
 // AI PROMPT ENHANCER — улучшает промпт через Pollinations text API
 // ═══════════════════════════════════════════════════════════════
 async function enhancePromptWithAI(userPrompt) {
-  const sys = 'Improve this AI image generation prompt by adding vivid details about lighting, atmosphere, composition and art style. Reply with ONLY the improved prompt, no quotes, no explanations, max 250 chars. Original prompt: ';
-  const fullQuery = encodeURIComponent(sys + userPrompt.trim());
+  const clean = sanitizePromptInput(userPrompt);
+  // Фиксированный системный промпт отделён от пользовательского ввода
+  const sys = 'Improve this AI image generation prompt by adding vivid details about lighting, atmosphere, composition and art style. Reply with ONLY the improved prompt, no quotes, no explanations, max 250 chars.\n\nOriginal prompt:\n';
+  const fullQuery = encodeURIComponent(sys + clean);
   try {
     const res = await withTimeout(
       fetch(`https://text.pollinations.ai/${fullQuery}?model=openai`),
       20000, 'enhance'
     );
-    if (!res.ok) throw new Error('HTTP ' + res.status);
+    if (!res.ok) throw new Error('Service error');
     const text = await res.text();
-    return text.replace(/^["']|["']$/g, '').replace(/\n/g, ' ').trim().slice(0, 400);
+    return sanitizePromptInput(
+      text.replace(/^["']|["']$/g, '').replace(/\n/g, ' ').trim()
+    ).slice(0, 400);
   } catch(e) {
-    console.warn('[Enhance] failed:', e.message);
     throw new Error('AI улучшение временно недоступно');
   }
 }
@@ -406,7 +440,7 @@ async function generateWithPollinations(prompt, model, ratio) {
   } catch (e) {
     if (e.message.includes('timeout')) {
       // Pollinations иногда долго генерирует — возвращаем URL, expo-image сам подгрузит
-      console.warn('[Generate] Probe timeout, returning URL anyway');
+      if (__DEV__) console.warn('[Generate] Probe timeout, returning URL anyway');
       return url;
     }
     throw new Error('Сервис недоступен. Попробуй ещё раз.');
@@ -459,7 +493,7 @@ async function ensureUserDoc(uid, name, email) {
     }
     return snap.data();
   } catch (e) {
-    console.warn('[ensureUserDoc]', e.message);
+    if (__DEV__) console.warn('[ensureUserDoc]');
     return { credits: 150, name, email, likedPosts: [] };
   }
 }
@@ -485,11 +519,12 @@ async function seedFirestore() {
     });
     await withTimeout(batch.commit(), CONFIG.firestoreTimeout, 'seed-commit');
   } catch (e) {
-    console.warn('[seedFirestore]', e.message);
+    if (__DEV__) console.warn('[seedFirestore]');
   }
 }
 
 async function uploadImageToStorage(imageUrl, uid) {
+  if (!isAllowedImageUrl(imageUrl)) throw new Error('Недопустимый источник изображения');
   try {
     const localPath = `${FileSystem.cacheDirectory}lumina_${Date.now()}.jpg`;
     await FileSystem.downloadAsync(imageUrl, localPath);
@@ -502,12 +537,13 @@ async function uploadImageToStorage(imageUrl, uid) {
     await FileSystem.deleteAsync(localPath, { idempotent: true });
     return url;
   } catch (e) {
-    console.warn('[uploadImage]', e.message);
+    if (__DEV__) console.warn('[uploadImage]');
     return imageUrl;
   }
 }
 
 async function saveImageToGallery(imageUrl) {
+  if (!isAllowedImageUrl(imageUrl)) throw new Error('Недопустимый источник изображения');
   const { status } = await MediaLibrary.requestPermissionsAsync();
   if (status !== 'granted') throw new Error('Permission denied');
   const localPath = `${FileSystem.cacheDirectory}lumina_save_${Date.now()}.jpg`;
@@ -808,7 +844,7 @@ function AuthScreen({ onGuest, onAuthSuccess }) {
             updateProfile(cred.user, { displayName: name.trim() || 'User' }),
             CONFIG.authTimeout, 'updateProfile'
           );
-        } catch (e) { console.warn('updateProfile:', e.message); }
+        } catch (e) { if (__DEV__) console.warn('[updateProfile]'); }
       } else {
         await withTimeout(
           signInWithEmailAndPassword(auth, email.trim(), password),
@@ -817,7 +853,7 @@ function AuthScreen({ onGuest, onAuthSuccess }) {
       }
       // onAuthStateChanged подхватит дальнейшую инициализацию
     } catch (e) {
-      console.warn('[Auth]', e.code, e.message);
+      if (__DEV__) console.warn('[Auth error]', e.code);
       if (e.message?.includes('timeout')) {
         setError('Сервер не отвечает. Попробуй ещё раз.');
       } else {
@@ -1191,22 +1227,29 @@ function CommentsSheet({ postId, visible, onClose }) {
     const q = query(collection(db, 'posts', postId, 'comments'), orderBy('createdAt', 'asc'));
     const unsub = onSnapshot(q, snap => {
       setComments(snap.docs.map(d => ({ id: d.id, ...d.data() })));
-    }, err => console.warn('[comments]', err.message));
+    }, err => { if (__DEV__) console.warn('[comments error]'); });
     return unsub;
   }, [postId, visible]);
 
+  const MAX_COMMENT_LENGTH = 500;
+
   const send = async () => {
-    if (!text.trim() || !user || user.isGuest) {
+    const trimmed = text.trim();
+    if (!trimmed || !user || user.isGuest) {
       if (user?.isGuest) showToast('Войди чтобы комментировать', 'info');
+      return;
+    }
+    if (trimmed.length > MAX_COMMENT_LENGTH) {
+      showToast(`Комментарий не может быть длиннее ${MAX_COMMENT_LENGTH} символов`, 'error');
       return;
     }
     setSending(true);
     try {
       await withTimeout(
         addDoc(collection(db, 'posts', postId, 'comments'), {
-          text: text.trim(),
+          text: trimmed,
           authorId: user.uid,
-          authorName: user.name,
+          authorName: sanitizeName(user.name),
           createdAt: serverTimestamp(),
         }),
         CONFIG.firestoreTimeout, 'addComment'
@@ -1276,11 +1319,14 @@ function CommentsSheet({ postId, visible, onClose }) {
                 style={{
                   flex: 1, backgroundColor: T.bgElevated, borderRadius: 14,
                   paddingHorizontal: 14, paddingVertical: 11, fontSize: 14,
-                  color: T.text, borderWidth: 1, borderColor: T.border, maxHeight: 80,
+                  color: T.text, borderWidth: 1,
+                  borderColor: text.length > MAX_COMMENT_LENGTH ? '#EF4444' : T.border,
+                  maxHeight: 80,
                 }}
                 value={text} onChangeText={setText}
                 placeholder={L.addComment}
                 placeholderTextColor={T.textDim}
+                maxLength={MAX_COMMENT_LENGTH}
                 multiline
               />
               <TouchableOpacity
@@ -1780,7 +1826,7 @@ function FeedScreen() {
       .then(snap => {
         if (snap.exists()) setLikedSet(new Set(snap.data().likedPosts || []));
       })
-      .catch(e => console.warn('[loadLikes]', e.message));
+      .catch(() => {});
   }, [user?.uid]);
 
   // Real-time feed with safety timeout
@@ -1808,7 +1854,7 @@ function FeedScreen() {
       },
       err => {
         clearTimeout(safetyTimer);
-        console.warn('[feed]', err.message);
+        if (__DEV__) console.warn('[feed error]');
         setFeed(BASE_FEED);
         setLoading(false);
         setRefresh(false);
@@ -1834,7 +1880,6 @@ function FeedScreen() {
     setSelected(p => p?.id === item.id ? { ...p, likesCount: (p.likesCount || 0) + (isLiked ? -1 : 1), _liked: !isLiked } : p);
 
     try {
-      // Не для seed-постов
       if (!item.id.startsWith('s')) {
         await Promise.all([
           updateDoc(doc(db, 'posts', item.id), { likesCount: increment(isLiked ? -1 : 1) }),
@@ -1842,7 +1887,11 @@ function FeedScreen() {
         ]);
       }
     } catch (e) {
-      console.warn('[toggleLike]', e.message);
+      // Откат optimistic update при ошибке
+      setLikedSet(p => { const n = new Set(p); isLiked ? n.add(item.id) : n.delete(item.id); return n; });
+      setFeed(p => p.map(i => i.id === item.id ? { ...i, likesCount: (i.likesCount || 0) + (isLiked ? 1 : -1) } : i));
+      setSelected(p => p?.id === item.id ? { ...p, likesCount: (p.likesCount || 0) + (isLiked ? 1 : -1), _liked: isLiked } : p);
+      if (__DEV__) console.warn('[toggleLike error]');
     }
   }, [user, likedSet, showToast]);
 
@@ -2028,7 +2077,7 @@ function ExploreScreen() {
         const items = snap.docs.map(d => ({ id: d.id, ...d.data() }));
         if (items.length) setTopPosts(items);
       },
-      err => console.warn('[explore]', err.message)
+      err => { if (__DEV__) console.warn('[explore error]'); }
     );
     return unsub;
   }, []);
@@ -2207,6 +2256,8 @@ function CreateScreen() {
   const [showHist, setShowH] = useState(false);
   const progressAnim = useRef(new Animated.Value(0)).current;
   const enhancePulse = useRef(new Animated.Value(1)).current;
+  const lastGenerateRef = useRef(0);
+  const GENERATE_COOLDOWN_MS = 15000;
 
   // AI prompt enhancer
   const enhancePrompt = async () => {
@@ -2259,6 +2310,13 @@ function CreateScreen() {
       showToast(L.noCredits, 'error');
       return;
     }
+    const now = Date.now();
+    if (now - lastGenerateRef.current < GENERATE_COOLDOWN_MS) {
+      const secsLeft = Math.ceil((GENERATE_COOLDOWN_MS - (now - lastGenerateRef.current)) / 1000);
+      showToast(`Подожди ещё ${secsLeft} сек перед следующей генерацией`, 'info');
+      return;
+    }
+    lastGenerateRef.current = now;
 
     haptic('Medium');
     setStage('generating');
@@ -2279,7 +2337,7 @@ function CreateScreen() {
         try {
           finalUrl = await withTimeout(uploadImageToStorage(tempUrl, user.uid), 12000, 'storage');
         } catch (e) {
-          console.warn('[uploadToStorage]', e.message);
+          if (__DEV__) console.warn('[uploadToStorage error]');
           finalUrl = tempUrl;
         }
       }
@@ -2304,7 +2362,7 @@ function CreateScreen() {
           setCredits(c => Math.max(0, (c || 5) - 5));
           showToast(L.postShared);
         } catch (e) {
-          console.warn('[saveToFirestore]', e.message);
+          if (__DEV__) console.warn('[saveToFirestore error]');
           showToast('Сохранено локально', 'info');
         }
       }
@@ -2783,7 +2841,7 @@ function ProfileScreen({ onOpenSettings }) {
         const totalLikes = posts.reduce((sum, p) => sum + (p.likesCount || 0), 0);
         setStats({ postsCount: posts.length, followersCount: 0, likesTotal: totalLikes });
       },
-      err => console.warn('[profile-posts]', err.message)
+      err => { if (__DEV__) console.warn('[profile-posts error]'); }
     );
     return unsub;
   }, [user?.uid]);
@@ -2798,7 +2856,7 @@ function ProfileScreen({ onOpenSettings }) {
       if (user?.uid && !user.isGuest) {
         await withTimeout(updateDoc(doc(db, 'users', user.uid), { name: newName.trim() }), CONFIG.firestoreTimeout, 'updateUserName');
       }
-    } catch (e) { console.warn(e); }
+    } catch (e) { if (__DEV__) console.warn('[error]'); }
     setSave(false);
     setEdit(false);
   };
@@ -3380,12 +3438,8 @@ export default function App() {
   useEffect(() => {
     let isCancelled = false;
 
-    // Защита 1: жёсткий таймаут на инициализацию
     const safetyTimer = setTimeout(() => {
-      if (!isCancelled) {
-        console.warn('[Auth] Safety timeout fired — forcing authReady=true');
-        setAuthReady(true);
-      }
+      if (!isCancelled) setAuthReady(true);
     }, CONFIG.authTimeout);
 
     const unsub = onAuthStateChanged(auth,
@@ -3394,38 +3448,25 @@ export default function App() {
         clearTimeout(safetyTimer);
         try {
           if (fbUser) {
-            // Защита 2: запускаем ensureUserDoc но не блокируем UI
-            const data = await ensureUserDoc(
-              fbUser.uid, fbUser.displayName || 'User', fbUser.email || ''
-            );
+            const safeName = sanitizeName(fbUser.displayName || 'User');
+            const data = await ensureUserDoc(fbUser.uid, safeName, fbUser.email || '');
             if (isCancelled) return;
             setCredits(data?.credits ?? 150);
-            setUser({
-              uid: fbUser.uid,
-              name: fbUser.displayName || 'User',
-              email: fbUser.email,
-              isGuest: false,
-            });
+            setUser({ uid: fbUser.uid, name: safeName, email: fbUser.email, isGuest: false });
           } else {
             setUser(null);
           }
         } catch (e) {
-          console.warn('[Auth callback]', e.message);
-          // Защита 3: даже при ошибке пользователь должен войти
+          if (__DEV__) console.warn('[Auth callback error]');
           if (fbUser) {
-            setUser({
-              uid: fbUser.uid,
-              name: fbUser.displayName || 'User',
-              email: fbUser.email,
-              isGuest: false,
-            });
+            const safeName = sanitizeName(fbUser.displayName || 'User');
+            setUser({ uid: fbUser.uid, name: safeName, email: fbUser.email, isGuest: false });
           }
         } finally {
           setAuthReady(true);
         }
       },
-      (error) => {
-        console.warn('[onAuthStateChanged error]', error.message);
+      () => {
         clearTimeout(safetyTimer);
         if (!isCancelled) setAuthReady(true);
       }
@@ -3453,7 +3494,7 @@ export default function App() {
       } else {
         await signOut(auth);
       }
-    } catch (e) { console.warn(e); }
+    } catch (e) { if (__DEV__) console.warn('[error]'); }
     setSettings(false);
   };
 
